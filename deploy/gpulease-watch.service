@@ -1,0 +1,13 @@
+[Unit]
+Description=gpulease adoption watcher (auto-books GPUs used by unmanaged jobs)
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/gpulease watch
+Restart=on-failure
+RestartSec=5
+Nice=5
+
+[Install]
+WantedBy=default.target
