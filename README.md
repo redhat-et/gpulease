@@ -54,11 +54,13 @@ nohup gpulease watch >>"${XDG_STATE_HOME:-$HOME/.local/state}/gpulease/watch.log
 ## Quick start
 
 ```sh
-gpulease pool                       # detected GPUs, pool, reservations
+gpulease pool                       # detected GPUs, pool, claims, reservations
 gpulease status                     # leases + live VRAM
 gpulease run -n 2 -- python bench.py
 gpulease run -n 1 --prefer 6 -- python repro.py
 gpulease run --gpu 5,6 -- python tp2.py
+gpulease claim 0-3 --for alice      # owner-scoped: only alice's pool includes 0-3
+gpulease run -n 8 --ignore-claims --reason "TP8 repro, coordinated" -- ...
 ```
 
 Long-lived servers:
@@ -84,14 +86,20 @@ gpulease unreserve 0-3
 | `checkout -n K [--ttl MIN]` | lease GPUs for a long-lived job; prints env exports |
 | `release ID` / `renew ID` / `env ID` | manage checkout leases |
 | `status [--json]` | leases, adopted/foreign usage, live VRAM |
-| `pool` | resolved config |
-| `reserve SPEC [--for NAME]` / `unreserve SPEC` | pool exclusions |
+| `pool` | resolved config, claims, your effective pool |
+| `claim SPEC --for USER` / `unclaim SPEC` | owner-scoped GPU claims |
+| `reserve SPEC [--for NAME]` / `unreserve SPEC` | global pool exclusions |
 | `reap` | drop stale lease records |
 | `watch [--once]` | adoption watcher loop |
 
 `--prefer 7,6` orders currently-free GPUs by preference and silently falls back to
 the rest of the pool. `--gpu 5,6` requires exactly those GPUs (waits per `--wait`,
 preserves order for rank mapping, and infers `-n`).
+
+`--ignore-claims --reason TEXT` is a break-glass override for `run`/`checkout`: it
+expands your effective pool to all non-reserved GPUs, but still respects active
+leases, adopted/foreign usage, and the VRAM idle check. It requires a reason, is
+recorded in the lease and in `audit.log`, and is visible in `status`.
 
 ## Configuration
 
@@ -102,8 +110,9 @@ and pool are auto-detected from `rocm-smi` when not set.
 ```json
 {
   "gpus": [0, 1, 2, 3, 4, 5, 6, 7],
-  "pool": [4, 5, 6, 7],
-  "reserved": {"0-3": "alice"},
+  "pool": [0, 1, 2, 3, 4, 5, 6, 7],
+  "claims": {"0-3": "alice"},
+  "reserved": {},
   "idle_check": true,
   "idle_threshold_gib": 2.0,
   "ttl_minutes": 240,
@@ -117,7 +126,8 @@ and pool are auto-detected from `rocm-smi` when not set.
 |---|---|
 | `gpus` | all GPU indices (default: detected) |
 | `pool` | allocatable indices (default: all non-reserved) |
-| `reserved` | `{range: note}` excluded from the pool |
+| `claims` | `{range: username}`: only that user's effective pool includes these GPUs |
+| `reserved` | `{range: note}` excluded from the pool for everyone |
 | `idle_check` | treat unleased GPUs above the VRAM threshold as busy |
 | `idle_threshold_gib` | busy threshold; idle cards sit near 0.3 GiB |
 | `ttl_minutes` | default checkout TTL |
@@ -125,8 +135,35 @@ and pool are auto-detected from `rocm-smi` when not set.
 | `adopt_grace_seconds` | release delay after unmanaged usage drains |
 | `default_wait_seconds` | default `--wait` (`-1` = forever) |
 
-Environment overrides: `GPULEASE_STATE_DIR`, `GPULEASE_ROCM_SMI`,
-`GPULEASE_PROC_ROOT`, `GPULEASE_OWNER`.
+Environment overrides: `GPULEASE_STATE_DIR`, `GPULEASE_SYSTEM_STATE_DIR`,
+`GPULEASE_ROCM_SMI`, `GPULEASE_PROC_ROOT`, `GPULEASE_OWNER`.
+
+State resolution: `GPULEASE_STATE_DIR` → `/var/lib/gpulease` when its `.shared`
+marker exists → `$XDG_STATE_HOME/gpulease` (default `~/.local/state/gpulease`).
+
+## Multi-user shared state
+
+For a box shared by several Unix accounts, install a group-writable state directory
+(`/var/lib/gpulease`, `root:gpulease` 2770) with ACLs so existing sessions get access
+without re-login:
+
+```sh
+sudo ./deploy/install-shared.sh --claim 0-3:alice alice bob
+# per user:
+bash deploy/install.sh
+sudo loginctl enable-linger alice bob
+```
+
+Every user runs their own `gpulease-watch` (adoption can only read its own uid's
+fdinfo). Claims are enforced centrally: alice's effective pool includes 0-3, bob's
+does not. `--ignore-claims` is available to every group member as an audited
+break-glass (see above). All lease records carry the creator's uid; `release`/`renew`
+are owner-only (root can override), while `status`/`env` are readable by the group.
+
+Trust model: members of the `gpulease` group can read lease command lines (in the
+shared state) and could tamper with lease files in the shared directory. Use this
+only with trusted collaborators. If that is not acceptable, the alternative is a
+root watcher/daemon plus a mediated API.
 
 ## How adoption works
 
@@ -150,7 +187,9 @@ GPUs unavailable, so cooperative jobs never collide with unmanaged ones.
 Paste [`docs/agent-prompt.md`](docs/agent-prompt.md) into whatever instruction
 surface your agents honor (AGENTS.md, context files, task templates). With the
 watcher running, adoption keeps bypassing agents safe anyway; the prompt turns
-collisions into queueing.
+collisions into queueing. Claims are enforced by the allocator, so agents do not
+need to encode GPU ranges. Agents must never use `--ignore-claims` unless a human
+explicitly asks for it.
 
 ## Limitations
 
@@ -164,6 +203,8 @@ collisions into queueing.
   attributed. `idle_check` covers most of the gap.
 - GPUs are addressed by HIP/`rocm-smi` index, never by render-node number
   (on MI300X/MI355X each GPU exposes multiple `renderD*` nodes for its XCDs).
+- Shared mode is a trusted-group design (see [Multi-user shared state](#multi-user-shared-state));
+  it is not a security boundary between group members.
 
 ## Alternatives
 
@@ -185,16 +226,28 @@ python3 -m unittest discover -s tests -v
 python3 tests/integration_onbox.sh   # 8-GPU ROCm host; bookkeeping-only checks
 ```
 
-Unit tests use a fake `rocm-smi`, fake `/proc` trees, and a temporary state
-directory; they do not need a GPU.
+Unit tests use a fake `rocm-smi`, fake `/proc` trees, and temporary state
+directories (including shared-mode/claims fixtures); they do not need a GPU.
+The on-box integration script runs as a single user; the two-account shared-state
+checklist is covered by `deploy/install-shared.sh` plus a manual verification pass
+(see the multi-user section).
 
 ## Uninstall
+
+Per-user install:
 
 ```sh
 systemctl --user disable --now gpulease-watch
 rm ~/.config/systemd/user/gpulease-watch.service
 rm ~/.local/bin/gpulease
 rm -rf "${XDG_STATE_HOME:-$HOME/.local/state}/gpulease"
+```
+
+Shared install (root; stop all users' watchers first):
+
+```sh
+sudo rm -rf /var/lib/gpulease
+sudo groupdel gpulease   # optional, after removing members
 ```
 
 ## License

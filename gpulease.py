@@ -7,6 +7,7 @@ import argparse
 import fcntl
 import json
 import os
+import pwd
 import random
 import re
 import secrets
@@ -18,11 +19,13 @@ from contextlib import contextmanager
 from pathlib import Path
 
 GIB = 1 << 30
+__version__ = "0.2.0"
 
 DEFAULTS = {
     "gpus": None,
     "pool": None,
     "reserved": {},
+    "claims": {},
     "idle_check": True,
     "idle_threshold_gib": 2.0,
     "ttl_minutes": 240.0,
@@ -35,14 +38,79 @@ DEFAULTS = {
 SELF = Path(__file__).resolve()
 
 
+def system_state_dir():
+    return Path(os.environ.get("GPULEASE_SYSTEM_STATE_DIR", "/var/lib/gpulease"))
+
+
 def state_dir():
     override = os.environ.get("GPULEASE_STATE_DIR")
     if override:
         return Path(override)
+    system = system_state_dir()
+    if (system / ".shared").exists():
+        return system
     base = os.environ.get("XDG_STATE_HOME")
     if base:
         return Path(base) / "gpulease"
     return Path.home() / ".local" / "state" / "gpulease"
+
+
+def is_shared():
+    return (state_dir() / ".shared").exists()
+
+
+def file_mode():
+    return 0o660 if is_shared() else 0o644
+
+
+def current_uid():
+    return os.getuid()
+
+
+def user_name(uid=None):
+    uid = current_uid() if uid is None else uid
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return str(uid)
+
+
+def uid_for_user(name):
+    if isinstance(name, int):
+        return name
+    try:
+        return pwd.getpwnam(str(name)).pw_uid
+    except KeyError:
+        return None
+
+
+def claims_map(cfg):
+    out = {}
+    for spec, who in (cfg.get("claims") or {}).items():
+        uid = uid_for_user(who)
+        if uid is None:
+            uid = -1
+        for g in parse_gpu_list(spec):
+            out[g] = uid
+    return out
+
+
+def claim_owner_name(cfg, gpu):
+    for spec, who in (cfg.get("claims") or {}).items():
+        if gpu in parse_gpu_list(spec):
+            return str(who)
+    return None
+
+
+def effective_pool(cfg, uid=None, ignore_claims=False):
+    uid = current_uid() if uid is None else uid
+    if ignore_claims:
+        reserved = set()
+        for spec in cfg.get("reserved", {}):
+            reserved.update(parse_gpu_list(spec))
+        return [g for g in cfg["gpus"] if g not in reserved]
+    cm = claims_map(cfg)
+    return [g for g in cfg["pool"] if cm.get(g) in (None, uid)]
 
 
 def rocm_smi_cmd():
@@ -54,7 +122,22 @@ def proc_root():
 
 
 def ensure_state():
-    for d in (state_dir(), locks_dir(), leases_dir(), releases_dir()):
+    dirs = (state_dir(), locks_dir(), leases_dir(), releases_dir())
+    if is_shared():
+        missing = [d for d in dirs if not d.is_dir()]
+        if missing:
+            raise SystemExit(
+                f"gpulease: shared state incomplete ({missing[0]}); "
+                "run deploy/install-shared.sh"
+            )
+        for d in dirs:
+            if not os.access(d, os.W_OK | os.X_OK):
+                raise SystemExit(
+                    f"gpulease: no write access to shared state {d}; "
+                    "check group membership and ACLs"
+                )
+        return
+    for d in dirs:
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -75,17 +158,33 @@ def release_file(lease_id):
 
 
 def log_path():
+    if is_shared():
+        return state_dir() / f"watch-{user_name()}.log"
     return state_dir() / "watch.log"
+
+
+def audit_log(msg):
+    ensure_state()
+    path = state_dir() / "audit.log"
+    line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {user_name()}({current_uid()}) {msg}\n"
+    fd = os.open(path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, file_mode())
+    try:
+        os.write(fd, line.encode())
+    finally:
+        os.close(fd)
 
 
 def load_config():
     cfg = dict(DEFAULTS)
     cfg["reserved"] = dict(DEFAULTS["reserved"])
+    cfg["claims"] = dict(DEFAULTS["claims"])
     p = state_dir() / "config.json"
     if p.exists():
         try:
             user = json.loads(p.read_text())
-        except (OSError, ValueError):
+        except (OSError, ValueError) as e:
+            if is_shared():
+                raise SystemExit(f"gpulease: cannot read shared config {p}: {e}")
             user = {}
         for k, v in user.items():
             cfg[k] = v
@@ -105,22 +204,23 @@ def load_config():
 
 def save_config(cfg):
     ensure_state()
-    p = state_dir() / "config.json"
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(cfg, indent=2, sort_keys=True) + "\n")
-    os.replace(tmp, p)
+    atomic_write_json(state_dir() / "config.json", cfg)
 
 
 def atomic_write_json(path, obj):
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\n")
+    try:
+        os.chmod(tmp, file_mode())
+    except OSError:
+        pass
     os.replace(tmp, path)
 
 
 @contextmanager
 def alloc_lock():
     ensure_state()
-    fd = os.open(state_dir() / "alloc.lock", os.O_CREAT | os.O_RDWR, 0o644)
+    fd = os.open(state_dir() / "alloc.lock", os.O_CREAT | os.O_RDWR, file_mode())
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield
@@ -137,7 +237,7 @@ def acquire_gpu_locks(gpus):
     try:
         for g in gpus:
             p = locks_dir() / f"gpu{g}.lock"
-            fd = os.open(p, os.O_CREAT | os.O_RDWR, 0o644)
+            fd = os.open(p, os.O_CREAT | os.O_RDWR, file_mode())
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
@@ -397,9 +497,9 @@ def lease_human(rec, now):
     return f"{t} owner={rec.get('owner', '-')} age={fmt_age(now - rec.get('created', now))} cmd={cmd!r}"
 
 
-def ordered_free(cfg, busy, vram, threshold, idle_check, required, prefer):
+def ordered_free(pool, busy, vram, threshold, idle_check, required, prefer):
     free = []
-    for g in cfg["pool"]:
+    for g in pool:
         if g in busy:
             continue
         if idle_check and vram.get(g, 0) >= threshold:
@@ -415,7 +515,9 @@ def ordered_free(cfg, busy, vram, threshold, idle_check, required, prefer):
 
 
 def try_allocate(n, cfg, owner, kind, wait, idle_check, ttl_minutes=None,
-                 quiet=False, required=None, prefer=None, requested=None):
+                 quiet=False, required=None, prefer=None, requested=None,
+                 pool=None, extra=None):
+    pool = list(cfg["pool"]) if pool is None else list(pool)
     threshold = cfg["idle_threshold_gib"] * GIB
     if idle_check is None:
         idle_check = cfg["idle_check"]
@@ -428,13 +530,13 @@ def try_allocate(n, cfg, owner, kind, wait, idle_check, ttl_minutes=None,
             reap_locked(leases, cfg, now)
             busy = busy_from_leases(leases, cfg, now)
         vram = rocm_vram() if idle_check else {}
-        cand = ordered_free(cfg, busy, vram, threshold, idle_check, required, prefer)
+        cand = ordered_free(pool, busy, vram, threshold, idle_check, required, prefer)
         if len(cand) >= n:
             with alloc_lock():
                 leases = read_leases()
                 reap_locked(leases, cfg, time.time())
                 busy2 = busy_from_leases(leases, cfg, time.time())
-                cand2 = ordered_free(cfg, busy2, vram, threshold, idle_check, required, prefer)
+                cand2 = ordered_free(pool, busy2, vram, threshold, idle_check, required, prefer)
                 if len(cand2) >= n:
                     gpus = cand2[:n]
                     try:
@@ -447,6 +549,7 @@ def try_allocate(n, cfg, owner, kind, wait, idle_check, ttl_minutes=None,
                             "id": new_lease_id(kind),
                             "type": kind,
                             "owner": owner,
+                            "uid": current_uid(),
                             "gpus": gpus,
                             "pids": [],
                             "holder_pid": os.getpid(),
@@ -456,6 +559,8 @@ def try_allocate(n, cfg, owner, kind, wait, idle_check, ttl_minutes=None,
                             "heartbeat": now2,
                             "requested": requested,
                         }
+                        if extra:
+                            rec.update(extra)
                         write_lease(rec)
                         return rec, fds
             continue
@@ -465,20 +570,20 @@ def try_allocate(n, cfg, owner, kind, wait, idle_check, ttl_minutes=None,
             holders = []
             for rec in busy.values():
                 holders.append(f"{fmt_gpus(rec.get('gpus', []))}:{rec['type']}")
-            avail = ordered_free(cfg, busy, vram, threshold, idle_check, None, None)
+            avail = ordered_free(pool, busy, vram, threshold, idle_check, None, None)
             want = ""
             if required:
                 want = f" want={fmt_gpus(required)}"
             elif prefer:
                 want = f" prefer={fmt_gpus(prefer)}"
-            extra = ""
+            idlebusy_msg = ""
             if idle_check:
-                idlebusy = [g for g in cfg["pool"] if g not in busy and vram.get(g, 0) >= threshold]
+                idlebusy = [g for g in pool if g not in busy and vram.get(g, 0) >= threshold]
                 if idlebusy:
-                    extra = f" unleased-busy={fmt_gpus(idlebusy)}"
+                    idlebusy_msg = f" unleased-busy={fmt_gpus(idlebusy)}"
             print(
-                f"gpulease: waiting for {n} GPU(s); free={fmt_gpus(avail)}{want} "
-                f"busy={holders}{extra}",
+                f"gpulease: waiting for {n} GPU(s); pool={fmt_gpus(pool)} "
+                f"free={fmt_gpus(avail)}{want} busy={holders}{idlebusy_msg}",
                 file=sys.stderr, flush=True,
             )
             last_msg = time.time()
@@ -507,8 +612,11 @@ def watch_log(msg):
     ensure_state()
     line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}\n"
     try:
-        with open(log_path(), "a") as f:
-            f.write(line)
+        fd = os.open(log_path(), os.O_CREAT | os.O_APPEND | os.O_WRONLY, file_mode())
+        try:
+            os.write(fd, line.encode())
+        finally:
+            os.close(fd)
     except OSError:
         pass
 
@@ -668,6 +776,8 @@ def reconcile_adopted(leases, clusters, now, owner):
             hit["pids"] = cluster["pids"]
             hit["cmd"] = cluster["cmd"]
             hit["heartbeat"] = now
+            hit["uid"] = current_uid()
+            hit["user"] = user_name()
             write_lease(hit)
             if changed:
                 events.append(("update", hit))
@@ -676,6 +786,8 @@ def reconcile_adopted(leases, clusters, now, owner):
                 "id": new_lease_id("adopted"),
                 "type": "adopted",
                 "owner": owner,
+                "uid": current_uid(),
+                "user": user_name(),
                 "gpus": cluster["gpus"],
                 "pids": cluster["pids"],
                 "holder_pid": None,
@@ -700,12 +812,22 @@ def reconcile_adopted(leases, clusters, now, owner):
 
 def reconcile_foreign(leases, cfg, own_vram, card_vram, now):
     threshold = cfg["idle_threshold_gib"] * GIB
-    foreign_gpus = []
-    for g in cfg["pool"]:
-        used = card_vram.get(g, 0)
-        explained = own_vram.get(g, 0)
-        if used - explained >= threshold:
-            foreign_gpus.append(g)
+    if is_shared():
+        covered = set()
+        for rec in leases.values():
+            if rec.get("type") in ("run", "checkout", "adopted") and lease_active(rec, cfg, now):
+                covered.update(rec.get("gpus", []))
+        foreign_gpus = [
+            g for g in cfg["pool"]
+            if card_vram.get(g, 0) >= threshold and g not in covered
+        ]
+    else:
+        foreign_gpus = []
+        for g in cfg["pool"]:
+            used = card_vram.get(g, 0)
+            explained = own_vram.get(g, 0)
+            if used - explained >= threshold:
+                foreign_gpus.append(g)
     events = []
     existing = [r for r in leases.values() if r.get("type") == "foreign"]
     if foreign_gpus:
@@ -754,7 +876,7 @@ def watch_cycle(cfg, announce=False):
         reap_locked(leases, cfg, now)
         holders = live_holder_pids(leases, cfg, now)
         clusters = build_clusters(filter_covered(usage, holders))
-        events = reconcile_adopted(leases, clusters, now, "adopted")
+        events = reconcile_adopted(leases, clusters, now, user_name())
         card_vram = rocm_vram()
         events += reconcile_foreign(leases, cfg, own_vram, card_vram, now)
     for action, rec in events:
@@ -766,20 +888,35 @@ def watch_cycle(cfg, announce=False):
 
 
 def resolve_gpu_request(args, cfg):
+    if args.ignore_claims and not (args.reason or "").strip():
+        print("gpulease: --ignore-claims requires a non-empty --reason", file=sys.stderr)
+        return None
+    if args.reason and not args.ignore_claims:
+        print("gpulease: --reason requires --ignore-claims", file=sys.stderr)
+        return None
+    uid = current_uid()
+    pool = effective_pool(cfg, uid, ignore_claims=args.ignore_claims)
+    cm = claims_map(cfg)
+    reserved = set()
+    for spec in cfg.get("reserved", {}):
+        reserved.update(parse_gpu_list(spec))
+
+    def why(g):
+        if g in reserved:
+            return "reserved"
+        owner = cm.get(g)
+        if owner is not None and owner != uid:
+            return f"claimed by {claim_owner_name(cfg, g)}"
+        return "not in pool"
+
     required = args.gpu_req
     prefer = args.prefer_req
     requested = None
-    pool = set(cfg["pool"])
     if required:
         bad = [g for g in required if g not in pool]
         if bad:
-            reserved = set()
-            for spec in cfg["reserved"]:
-                reserved.update(parse_gpu_list(spec))
-            msg = f"gpulease: gpu(s) {fmt_gpus(bad)} not in pool {fmt_gpus(cfg['pool'])}"
-            if any(g in reserved for g in bad):
-                msg += " (reserved; run 'gpulease unreserve <spec>' first)"
-            print(msg, file=sys.stderr)
+            details = "; ".join(f"gpu {g} {why(g)}" for g in bad)
+            print(f"gpulease: cannot require gpu(s) {fmt_gpus(bad)}: {details}", file=sys.stderr)
             return None
         requested = "gpu=" + ",".join(str(g) for g in required)
     elif prefer:
@@ -787,9 +924,9 @@ def resolve_gpu_request(args, cfg):
         dropped = [g for g in prefer if g not in pool]
         if dropped:
             print(f"gpulease: ignoring preferred gpu(s) {fmt_gpus(dropped)} "
-                  f"(not in pool {fmt_gpus(cfg['pool'])})", file=sys.stderr)
+                  f"({why(dropped[0])})", file=sys.stderr)
         if not kept:
-            print("gpulease: no preferred GPU is in the pool", file=sys.stderr)
+            print("gpulease: no preferred GPU is allocatable", file=sys.stderr)
             return None
         prefer = kept
         requested = "prefer=" + ",".join(str(g) for g in prefer)
@@ -801,7 +938,24 @@ def resolve_gpu_request(args, cfg):
         return None
     else:
         n = args.num
-    return n, required, prefer, requested
+    return n, required, prefer, requested, pool
+
+
+def apply_claim_override(rec, cfg, args):
+    if not args.ignore_claims:
+        return
+    cm = claims_map(cfg)
+    ignored = [g for g in rec["gpus"] if cm.get(g) not in (None, current_uid())]
+    with alloc_lock():
+        latest = read_lease(rec["id"]) or rec
+        latest["claims_ignored"] = ignored
+        latest["reason"] = args.reason
+        write_lease(latest)
+        rec.update(latest)
+    audit_log(
+        f"ignore-claims lease={rec['id']} gpus={fmt_gpus(rec['gpus'])} "
+        f"claims_ignored={fmt_gpus(ignored)} reason={args.reason!r}"
+    )
 
 
 def cmd_run(args):
@@ -809,7 +963,7 @@ def cmd_run(args):
     req = resolve_gpu_request(args, cfg)
     if req is None:
         return 2
-    n, required, prefer, requested = req
+    n, required, prefer, requested, pool = req
     cmd = args.command
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
@@ -818,18 +972,22 @@ def cmd_run(args):
         return 2
     rec, fds = try_allocate(
         n, cfg, args.owner, "run", args.wait, args.idle_check, quiet=args.quiet,
-        required=required, prefer=prefer, requested=requested,
+        required=required, prefer=prefer, requested=requested, pool=pool,
     )
     if rec is None:
         print(
-            f"gpulease: timed out waiting for {n} GPU(s) in pool {fmt_gpus(cfg['pool'])}",
+            f"gpulease: timed out waiting for {n} GPU(s) in pool {fmt_gpus(pool)}",
             file=sys.stderr,
         )
         return 3
+    apply_claim_override(rec, cfg, args)
     env = build_env(rec["gpus"], rec["id"])
+    override = ""
+    if rec.get("claims_ignored"):
+        override = f" claims-ignored={fmt_gpus(rec['claims_ignored'])}"
     print(
         f"gpulease: lease {rec['id']} gpus={fmt_gpus(rec['gpus'])} "
-        f"(pool {fmt_gpus(cfg['pool'])}, reserved {list(cfg['reserved'])})",
+        f"(pool {fmt_gpus(pool)}, uid {rec.get('uid')}){override}",
         file=sys.stderr, flush=True,
     )
     try:
@@ -879,26 +1037,29 @@ def cmd_checkout(args):
     req = resolve_gpu_request(args, cfg)
     if req is None:
         return 2
-    n, required, prefer, requested = req
+    n, required, prefer, requested, pool = req
     if args.idle_check is None:
         args.idle_check = cfg["idle_check"]
     ttl = args.ttl if args.ttl is not None else cfg["ttl_minutes"]
     rec, fds = try_allocate(
         n, cfg, args.owner, "checkout", args.wait, args.idle_check,
         ttl_minutes=ttl, quiet=args.quiet,
-        required=required, prefer=prefer, requested=requested,
+        required=required, prefer=prefer, requested=requested, pool=pool,
     )
     if rec is None:
         print(
-            f"gpulease: timed out waiting for {n} GPU(s) in pool {fmt_gpus(cfg['pool'])}",
+            f"gpulease: timed out waiting for {n} GPU(s) in pool {fmt_gpus(pool)}",
             file=sys.stderr,
         )
         return 3
+    apply_claim_override(rec, cfg, args)
     try:
         release_file(rec["id"]).unlink()
     except OSError:
         pass
-    logf = open(log_path(), "ab")
+    logf = os.fdopen(
+        os.open(log_path(), os.O_CREAT | os.O_APPEND | os.O_WRONLY, file_mode()), "ab"
+    )
     try:
         holder = subprocess.Popen(
             [sys.executable, str(SELF), "_hold", rec["id"]],
@@ -963,6 +1124,19 @@ def cmd_hold(args):
     return 0
 
 
+def check_lease_owner(rec, action):
+    if not is_shared():
+        return True
+    uid = rec.get("uid")
+    if uid is None or uid == current_uid() or current_uid() == 0:
+        return True
+    print(
+        f"gpulease: cannot {action} lease {rec['id']}: owned by {user_name(uid)}",
+        file=sys.stderr,
+    )
+    return False
+
+
 def cmd_release(args):
     ensure_state()
     lease_id = args.lease_id
@@ -975,7 +1149,14 @@ def cmd_release(args):
             remove_lease(lease_id)
             print(f"gpulease: removed {rec['type']} lease {lease_id}")
             return 0
-        release_file(lease_id).write_text("released\n")
+        if not check_lease_owner(rec, "release"):
+            return 1
+        rf = release_file(lease_id)
+        rf.write_text("released\n")
+        try:
+            os.chmod(rf, file_mode())
+        except OSError:
+            pass
         hp = rec.get("holder_pid")
     if hp and pid_alive(hp):
         for _ in range(20):
@@ -1001,6 +1182,8 @@ def cmd_renew(args):
         if rec.get("type") not in ("checkout",):
             print("gpulease: renew only applies to checkout leases", file=sys.stderr)
             return 1
+        if not check_lease_owner(rec, "renew"):
+            return 1
         rec["expires"] = time.time() + ttl * 60
         write_lease(rec)
     print(f"gpulease: renewed {rec['id']} ttl={ttl:.0f}m")
@@ -1020,12 +1203,15 @@ def cmd_env(args):
 def cmd_status(args):
     cfg = load_config()
     now = time.time()
+    uid = current_uid()
     with alloc_lock():
         leases = read_leases()
         removed = reap_locked(leases, cfg, now)
         active = [r for r in leases.values() if lease_active(r, cfg, now)]
     vram = rocm_vram()
     threshold = cfg["idle_threshold_gib"] * GIB
+    cm = claims_map(cfg)
+    pool = effective_pool(cfg, uid)
     by_gpu = {}
     for rec in active:
         for g in rec.get("gpus", []):
@@ -1038,41 +1224,54 @@ def cmd_status(args):
         rec = by_gpu.get(g)
         used = vram.get(g, 0)
         reserved = g in reserved_gpus
+        claim = claim_owner_name(cfg, g)
+        claim_uid = cm.get(g)
         if rec:
             row = {
-                "gpu": g, "reserved": reserved, "vram_bytes": used, "state": "leased",
-                "lease_type": rec["type"], "owner": rec.get("owner", ""),
+                "gpu": g, "reserved": reserved, "claim": claim, "vram_bytes": used,
+                "state": "leased", "lease_type": rec["type"],
+                "owner": rec.get("owner", ""), "uid": rec.get("uid"),
                 "age_seconds": int(now - rec.get("created", now)),
                 "cmd": rec.get("cmd", ""), "lease_id": rec["id"],
             }
         elif used < threshold:
+            if reserved:
+                state = "reserved"
+            elif claim_uid is not None:
+                state = "claimed"
+            else:
+                state = "free"
             row = {
-                "gpu": g, "reserved": reserved, "vram_bytes": used,
-                "state": "reserved" if reserved else "free",
-                "lease_type": None, "owner": None, "age_seconds": None, "cmd": None,
-                "lease_id": None,
+                "gpu": g, "reserved": reserved, "claim": claim, "vram_bytes": used,
+                "state": state, "lease_type": None, "owner": None, "uid": None,
+                "age_seconds": None, "cmd": None, "lease_id": None,
             }
         else:
             row = {
-                "gpu": g, "reserved": reserved, "vram_bytes": used,
+                "gpu": g, "reserved": reserved, "claim": claim, "vram_bytes": used,
                 "state": "reserved-busy" if reserved else "busy",
-                "lease_type": None, "owner": None, "age_seconds": None, "cmd": None,
-                "lease_id": None,
+                "lease_type": None, "owner": None, "uid": None,
+                "age_seconds": None, "cmd": None, "lease_id": None,
             }
         rows.append(row)
     if args.json:
         print(json.dumps({
-            "pool": cfg["pool"], "reserved": cfg["reserved"],
+            "pool": cfg["pool"], "reserved": cfg["reserved"], "claims": cfg["claims"],
+            "effective_pool": pool, "uid": uid, "user": user_name(uid),
+            "shared": is_shared(), "state_dir": str(state_dir()),
             "leases": active, "gpus": rows, "reaped": removed,
         }, indent=2))
         return 0
-    print(f"pool={fmt_gpus(cfg['pool'])} reserved={cfg['reserved']} "
-          f"idle_threshold={cfg['idle_threshold_gib']:.1f}GiB")
-    print(f"{'GPU':<4} {'RES':<4} {'VRAM':>9} {'STATE':<14} {'TYPE':<8} {'OWNER':<10} {'AGE':<6} CMD")
+    print(f"pool={fmt_gpus(cfg['pool'])} effective={fmt_gpus(pool)} "
+          f"claims={cfg['claims']} reserved={cfg['reserved']} "
+          f"idle_threshold={cfg['idle_threshold_gib']:.1f}GiB "
+          f"mode={'shared' if is_shared() else 'user'}")
+    print(f"{'GPU':<4} {'RES':<4} {'CLAIM':<12} {'VRAM':>9} {'STATE':<14} {'TYPE':<8} {'OWNER':<10} {'AGE':<6} CMD")
     for row in rows:
         vram_s = f"{row['vram_bytes'] / GIB:8.1f}G"
         print(
-            f"{row['gpu']:<4} {'yes' if row['reserved'] else '-':<4} {vram_s:>9} "
+            f"{row['gpu']:<4} {'yes' if row['reserved'] else '-':<4} "
+            f"{(row['claim'] or '-'):<12} {vram_s:>9} "
             f"{row['state']:<14} {(row['lease_type'] or '-'):<8} {(row['owner'] or '-'):<10} "
             f"{fmt_age(row['age_seconds']) if row['age_seconds'] is not None else '-':<6} "
             f"{row['cmd'] or ''}"
@@ -1080,15 +1279,23 @@ def cmd_status(args):
     for rec in active:
         holders = ",".join(str(p) for p in rec.get("pids", [])[:6])
         want = f" want={rec['requested']}" if rec.get("requested") else ""
+        over = ""
+        if rec.get("claims_ignored"):
+            over = f" claims-ignored={fmt_gpus(rec['claims_ignored'])} reason={rec.get('reason')!r}"
         print(f"lease {rec['id']} {lease_human(rec, now)} "
-              f"gpus={fmt_gpus(rec.get('gpus', []))} pids=[{holders}]{want}")
+              f"gpus={fmt_gpus(rec.get('gpus', []))} pids=[{holders}]{want}{over}")
     return 0
 
 
 def cmd_pool(args):
     cfg = load_config()
+    uid = current_uid()
     print(json.dumps({
-        "gpus": cfg["gpus"], "pool": cfg["pool"], "reserved": cfg["reserved"],
+        "gpus": cfg["gpus"], "pool": cfg["pool"],
+        "effective_pool": effective_pool(cfg, uid),
+        "claims": cfg["claims"], "reserved": cfg["reserved"],
+        "shared": is_shared(), "state_dir": str(state_dir()),
+        "user": user_name(uid), "uid": uid,
         "idle_check": cfg["idle_check"],
         "idle_threshold_gib": cfg["idle_threshold_gib"],
         "ttl_minutes": cfg["ttl_minutes"],
@@ -1103,26 +1310,96 @@ def cmd_reserve(args):
     gpus = parse_gpu_list(args.spec)
     spec = f"{min(gpus)}-{max(gpus)}" if len(gpus) > 1 else str(gpus[0])
     note = args.for_who or "reserved"
-    cfg["reserved"][spec] = note
-    cfg["pool"] = sorted(set(cfg["pool"]) - set(gpus))
-    save_config(cfg)
+    with alloc_lock():
+        cfg = load_config()
+        cfg["reserved"][spec] = note
+        cfg["pool"] = sorted(set(cfg["pool"]) - set(gpus))
+        save_config(cfg)
+    audit_log(f"reserve {fmt_gpus(gpus)} note={note!r}")
     print(f"gpulease: reserved {fmt_gpus(gpus)} ({note}); pool now {fmt_gpus(cfg['pool'])}")
     return 0
 
 
 def cmd_unreserve(args):
-    cfg = load_config()
     gpus = parse_gpu_list(args.spec)
-    changed = []
-    for spec in list(cfg["reserved"]):
-        r = set(parse_gpu_list(spec))
-        if r & set(gpus):
-            changed.append(spec)
-            del cfg["reserved"][spec]
-    cfg["pool"] = sorted(set(cfg["pool"]) | set(gpus))
-    save_config(cfg)
+    with alloc_lock():
+        cfg = load_config()
+        changed = []
+        for spec in list(cfg["reserved"]):
+            r = set(parse_gpu_list(spec))
+            if r & set(gpus):
+                changed.append(spec)
+                del cfg["reserved"][spec]
+        cfg["pool"] = sorted(set(cfg["pool"]) | set(gpus))
+        save_config(cfg)
+    audit_log(f"unreserve {fmt_gpus(gpus)}")
     print(f"gpulease: unreserved {fmt_gpus(gpus)} (removed entries: {changed}); "
           f"pool now {fmt_gpus(cfg['pool'])}")
+    return 0
+
+
+def claim_name_map(cfg):
+    out = {}
+    for spec, who in (cfg.get("claims") or {}).items():
+        for g in parse_gpu_list(spec):
+            out[g] = str(who)
+    return out
+
+
+def rebuild_claims(cfg, per_gpu):
+    by_owner = {}
+    for g, who in sorted(per_gpu.items()):
+        by_owner.setdefault(who, []).append(g)
+    claims = {}
+    for who, gs in by_owner.items():
+        start = prev = gs[0]
+        for g in gs[1:]:
+            if g == prev + 1:
+                prev = g
+                continue
+            key = f"{start}-{prev}" if start != prev else str(start)
+            claims[key] = who
+            start = prev = g
+        key = f"{start}-{prev}" if start != prev else str(start)
+        claims[key] = who
+    cfg["claims"] = claims
+
+
+def cmd_claim(args):
+    gpus = parse_gpu_list(args.spec)
+    who = args.for_who or user_name()
+    if uid_for_user(who) is None:
+        print(f"gpulease: unknown user {who!r}", file=sys.stderr)
+        return 1
+    with alloc_lock():
+        cfg = load_config()
+        unknown = [g for g in gpus if g not in cfg["gpus"]]
+        if unknown:
+            print(f"gpulease: gpu(s) {fmt_gpus(unknown)} do not exist", file=sys.stderr)
+            return 1
+        per = claim_name_map(cfg)
+        for g in gpus:
+            per[g] = who
+        rebuild_claims(cfg, per)
+        save_config(cfg)
+        claims = cfg["claims"]
+    audit_log(f"claim {fmt_gpus(gpus)} for {who}")
+    print(f"gpulease: claimed {fmt_gpus(gpus)} for {who}; claims now {claims}")
+    return 0
+
+
+def cmd_unclaim(args):
+    gpus = parse_gpu_list(args.spec)
+    with alloc_lock():
+        cfg = load_config()
+        per = claim_name_map(cfg)
+        for g in gpus:
+            per.pop(g, None)
+        rebuild_claims(cfg, per)
+        save_config(cfg)
+        claims = cfg["claims"]
+    audit_log(f"unclaim {fmt_gpus(gpus)}")
+    print(f"gpulease: unclaimed {fmt_gpus(gpus)}; claims now {claims}")
     return 0
 
 
@@ -1157,6 +1434,7 @@ def cmd_watch(args):
 
 def build_parser():
     p = argparse.ArgumentParser(prog="gpulease", description="GPU leases with adoption of unmanaged jobs")
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def add_common(sp, with_wait=True):
@@ -1175,6 +1453,10 @@ def build_parser():
                             help="seconds to wait for free GPUs; 0=fail fast, -1=forever")
         sp.add_argument("--idle-check", dest="idle_check", action="store_true", default=None)
         sp.add_argument("--no-idle-check", dest="idle_check", action="store_false")
+        sp.add_argument("--ignore-claims", action="store_true",
+                        help="break glass: bypass claims (requires --reason); still respects leases and VRAM")
+        sp.add_argument("--reason", default=None,
+                        help="audit reason for --ignore-claims")
         sp.add_argument("-q", "--quiet", action="store_true")
 
     sp = sub.add_parser("run", help="wait for N GPUs, run command with them, release on exit")
@@ -1216,6 +1498,15 @@ def build_parser():
     sp = sub.add_parser("unreserve", help="return reserved GPUs to the pool")
     sp.add_argument("spec")
     sp.set_defaults(func=cmd_unreserve)
+
+    sp = sub.add_parser("claim", help="claim GPUs for a user (e.g. claim 0-3 --for alice)")
+    sp.add_argument("spec")
+    sp.add_argument("--for", dest="for_who", default=None)
+    sp.set_defaults(func=cmd_claim)
+
+    sp = sub.add_parser("unclaim", help="remove a claim")
+    sp.add_argument("spec")
+    sp.set_defaults(func=cmd_unclaim)
 
     sp = sub.add_parser("reap", help="drop stale lease records")
     sp.add_argument("-q", "--quiet", action="store_true")

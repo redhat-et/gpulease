@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -244,6 +245,144 @@ class TestCLI(Base):
         self.assertEqual(cfg["reserved"], {})
 
 
+class TestSharedClaims(Base):
+    def enable_shared(self, claims=None, pool=None):
+        (self.state / ".shared").write_text("")
+        for name in ("locks", "leases", "releases"):
+            (self.state / name).mkdir(exist_ok=True)
+        (self.state / "config.json").write_text(json.dumps({
+            "gpus": list(range(8)),
+            "pool": pool if pool is not None else list(range(8)),
+            "reserved": {},
+            "claims": claims or {},
+        }))
+        self.set_rocm(vram={}, bus={})
+
+    def test_unknown_claim_excluded_and_owner_allowed(self):
+        self.enable_shared(claims={"0-3": "definitely-not-a-user"})
+        cfg = gpulease.load_config()
+        self.assertEqual(gpulease.effective_pool(cfg), [4, 5, 6, 7])
+        self.enable_shared(claims={"0-3": gpulease.user_name()})
+        cfg = gpulease.load_config()
+        self.assertEqual(gpulease.effective_pool(cfg), list(range(8)))
+
+    def test_cli_gpu_claim_error(self):
+        self.enable_shared(claims={"0-3": "definitely-not-a-user"})
+        r = self.cli("run", "-g", "0", "--wait", "0", "--", "true")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("claimed by definitely-not-a-user", r.stderr)
+
+    def test_cli_prefer_ignores_claim(self):
+        self.enable_shared(claims={"0": "definitely-not-a-user"})
+        r = self.cli("run", "-p", "0,4", "--wait", "0", "--", "sleep", "0.1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("ignoring preferred", r.stderr)
+        self.assertIn("gpus=[4]", r.stderr)
+
+    def test_break_glass_requires_reason(self):
+        self.enable_shared(claims={"0-3": "definitely-not-a-user"})
+        r = self.cli("run", "--ignore-claims", "-g", "0", "--wait", "0", "--", "true")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("requires a non-empty --reason", r.stderr)
+        r = self.cli("run", "--reason", "test", "-g", "0", "--wait", "0", "--", "true")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("requires --ignore-claims", r.stderr)
+
+    def test_break_glass_allows_claim_and_audits(self):
+        self.enable_shared(claims={"0-3": "definitely-not-a-user"})
+        r = self.cli("run", "--ignore-claims", "--reason", "tp8 test",
+                     "-g", "0", "--wait", "0", "--", "sleep", "0.1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("gpus=[0]", r.stderr)
+        self.assertIn("claims-ignored=[0]", r.stderr)
+        audit = (self.state / "audit.log").read_text()
+        self.assertIn("ignore-claims", audit)
+        self.assertIn("tp8 test", audit)
+
+    def test_break_glass_respects_active_leases(self):
+        self.enable_shared(claims={"0-3": "definitely-not-a-user"})
+        now = time.time()
+        gpulease.write_lease({
+            "id": "other-run", "type": "run", "owner": "other", "uid": 424242,
+            "gpus": [0], "pids": [], "holder_pid": os.getpid(), "cmd": "",
+            "created": now, "expires": None, "heartbeat": now,
+        })
+        r = self.cli("run", "--ignore-claims", "--reason", "test",
+                     "-g", "0", "--wait", "0", "--", "true")
+        self.assertEqual(r.returncode, 3)
+
+    def test_release_renew_owner_enforced(self):
+        self.enable_shared()
+        now = time.time()
+        gpulease.write_lease({
+            "id": "other-checkout", "type": "checkout", "owner": "other",
+            "uid": 424242, "gpus": [4], "pids": [], "holder_pid": os.getpid(),
+            "cmd": "", "created": now, "expires": now + 600, "heartbeat": now,
+        })
+        r = self.cli("release", "other-checkout")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("owned by", r.stderr)
+        r = self.cli("renew", "other-checkout")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("owned by", r.stderr)
+
+    def test_shared_foreign_coverage(self):
+        self.enable_shared()
+        cfg = gpulease.load_config()
+        now = time.time()
+        leases = {
+            "other-run": {
+                "id": "other-run", "type": "run", "owner": "other", "uid": 424242,
+                "gpus": [4], "pids": [], "holder_pid": os.getpid(), "cmd": "",
+                "created": now, "expires": None, "heartbeat": now,
+            }
+        }
+        vram = {4: 50 * gpulease.GIB}
+        events = gpulease.reconcile_foreign(leases, cfg, {}, vram, now)
+        self.assertEqual(events, [])
+        self.assertFalse(any(r["type"] == "foreign" for r in leases.values()))
+
+        leases = {}
+        events = gpulease.reconcile_foreign(leases, cfg, {}, vram, now)
+        self.assertEqual([e[0] for e in events], ["foreign"])
+        foreign = [r for r in leases.values() if r["type"] == "foreign"][0]
+        self.assertEqual(foreign["gpus"], [4])
+        events = gpulease.reconcile_foreign(leases, cfg, {}, vram, now)
+        self.assertEqual(events, [])
+        self.assertTrue(any(r["type"] == "foreign" for r in leases.values()))
+
+    def test_shared_file_modes_and_log(self):
+        self.enable_shared()
+        now = time.time()
+        gpulease.write_lease({
+            "id": "shared-run", "type": "run", "owner": "me", "uid": os.getuid(),
+            "gpus": [4], "pids": [], "holder_pid": os.getpid(), "cmd": "",
+            "created": now, "expires": None, "heartbeat": now,
+        })
+        path = self.state / "leases" / "shared-run.json"
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o660)
+        gpulease.watch_log("hello")
+        log = self.state / f"watch-{gpulease.user_name()}.log"
+        self.assertTrue(log.exists())
+        self.assertIn("hello", log.read_text())
+
+    def test_shared_requires_complete_state(self):
+        self.enable_shared()
+        shutil.rmtree(self.state / "leases")
+        with self.assertRaises(SystemExit):
+            gpulease.ensure_state()
+
+    def test_system_state_discovery(self):
+        shared = self.tmp / "system-state"
+        shared.mkdir()
+        (shared / ".shared").write_text("")
+        with unittest.mock.patch.dict(os.environ, {
+            "GPULEASE_SYSTEM_STATE_DIR": str(shared),
+        }, clear=False):
+            os.environ.pop("GPULEASE_STATE_DIR", None)
+            self.assertEqual(gpulease.state_dir(), shared)
+
+
 class TestDefaults(Base):
     def test_auto_detects_pool(self):
         self.set_rocm(vram={i: 300 * 1024 * 1024 for i in range(8)}, bus={})
@@ -300,7 +439,7 @@ class TestGpuSelection(Base):
         self.set_rocm(vram={}, bus={})
         r = self.cli("run", "-g", "2", "--wait", "0", "--", "true")
         self.assertEqual(r.returncode, 2)
-        self.assertIn("not in pool", r.stderr)
+        self.assertIn("cannot require", r.stderr)
         self.assertIn("reserved", r.stderr)
 
     def test_cli_n_conflict(self):

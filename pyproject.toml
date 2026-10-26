@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gpulease"
-version = "0.1.0"
+version = "0.2.0"
 description = "GPU leases with automatic adoption of unmanaged jobs, for shared ROCm hosts"
 readme = "README.md"
 license = "Apache-2.0"

@@ -21,6 +21,8 @@ and never target GPUs that `gpulease status` reports as reserved.
 - If GPUs are busy, wait or ask for fewer GPUs; do not launch anyway.
 - Optional selection: `--prefer 6` (use 6 if free, else any free pool GPU) or
   `--gpu 5,6` (exactly 5,6; waits until free; order = rank order).
+- Claims and reservations are enforced automatically; never use `--ignore-claims`
+  unless a human explicitly instructs you to, with a reason.
 
 Examples:
 
