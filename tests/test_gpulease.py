@@ -246,14 +246,14 @@ class TestCLI(Base):
 
 
 class TestSharedClaims(Base):
-    def enable_shared(self, claims=None, pool=None):
+    def enable_shared(self, claims=None, pool=None, reserved=None):
         (self.state / ".shared").write_text("")
         for name in ("locks", "leases", "releases"):
             (self.state / name).mkdir(exist_ok=True)
         (self.state / "config.json").write_text(json.dumps({
             "gpus": list(range(8)),
             "pool": pool if pool is not None else list(range(8)),
-            "reserved": {},
+            "reserved": reserved or {},
             "claims": claims or {},
         }))
         self.set_rocm(vram={}, bus={})
@@ -298,6 +298,47 @@ class TestSharedClaims(Base):
         audit = (self.state / "audit.log").read_text()
         self.assertIn("ignore-claims", audit)
         self.assertIn("tp8 test", audit)
+
+    def test_break_glass_respects_reserved(self):
+        self.enable_shared(reserved={"6": "maintenance"})
+        r = self.cli("run", "--ignore-claims", "--reason", "test",
+                     "-g", "6", "--wait", "0", "--", "true")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("reserved", r.stderr)
+
+    def test_hold_hidden_from_help_and_choices(self):
+        self.set_rocm(vram={}, bus={})
+        h = self.cli("--help")
+        self.assertEqual(h.returncode, 0)
+        self.assertNotIn("_hold", h.stdout)
+        bad = self.cli("show")
+        self.assertEqual(bad.returncode, 2)
+        self.assertNotIn("_hold", bad.stderr)
+
+    def test_hold_direct_lifecycle(self):
+        self.set_rocm(vram={}, bus={})
+        now = time.time()
+        gpulease.write_lease({
+            "id": "manual-hold", "type": "checkout", "owner": "me",
+            "uid": os.getuid(), "gpus": [4], "pids": [], "holder_pid": None,
+            "cmd": "", "created": now, "expires": now + 600, "heartbeat": now,
+        })
+        proc = subprocess.Popen(
+            [sys.executable, str(MODULE), "_hold", "manual-hold"],
+            env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.time() + 5
+            while time.time() < deadline and not gpulease.read_lease("manual-hold"):
+                time.sleep(0.1)
+            (self.state / "releases").mkdir(exist_ok=True)
+            (self.state / "releases" / "manual-hold").write_text("released\n")
+            proc.wait(timeout=10)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        self.assertEqual(proc.returncode, 0)
+        self.assertIsNone(gpulease.read_lease("manual-hold"))
 
     def test_break_glass_respects_active_leases(self):
         self.enable_shared(claims={"0-3": "definitely-not-a-user"})

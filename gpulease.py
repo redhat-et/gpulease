@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 GIB = 1 << 30
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 DEFAULTS = {
     "gpus": None,
@@ -1516,14 +1516,17 @@ def build_parser():
     sp.add_argument("--once", action="store_true")
     sp.add_argument("--interval", type=float, default=None)
     sp.set_defaults(func=cmd_watch)
-
-    sp = sub.add_parser("_hold", help=argparse.SUPPRESS)
-    sp.add_argument("lease_id")
-    sp.set_defaults(func=cmd_hold)
     return p
 
 
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "_hold":
+        if len(argv) != 2:
+            print("gpulease: internal _hold requires a lease id", file=sys.stderr)
+            return 2
+        ensure_state()
+        return cmd_hold(argparse.Namespace(lease_id=argv[1]))
     args = build_parser().parse_args(argv)
     cfg = load_config()
     if not cfg["gpus"]:

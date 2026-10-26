@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.1
+
+- Hide the internal `_hold` subcommand from `--help`, usage, and invalid-choice
+  errors; it is dispatched before argparse and no longer requires GPU detection.
+- Clarify that reservations are global/maintenance exclusions and are not bypassed
+  by `--ignore-claims`, while claims remain user-scoped and overridable.
+
 ## 0.2.0
 
 - Shared multi-user state: `/var/lib/gpulease` with group + ACL access, discovered

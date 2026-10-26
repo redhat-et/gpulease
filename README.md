@@ -100,6 +100,8 @@ preserves order for rank mapping, and infers `-n`).
 expands your effective pool to all non-reserved GPUs, but still respects active
 leases, adopted/foreign usage, and the VRAM idle check. It requires a reason, is
 recorded in the lease and in `audit.log`, and is visible in `status`.
+Claims are user-scoped and overridable; reservations are global and are **not**
+bypassed by break-glass.
 
 ## Configuration
 
@@ -127,7 +129,7 @@ and pool are auto-detected from `rocm-smi` when not set.
 | `gpus` | all GPU indices (default: detected) |
 | `pool` | allocatable indices (default: all non-reserved) |
 | `claims` | `{range: username}`: only that user's effective pool includes these GPUs |
-| `reserved` | `{range: note}` excluded from the pool for everyone |
+| `reserved` | `{range: note}` excluded from the pool for everyone; not bypassed by `--ignore-claims` (maintenance/global exclusion) |
 | `idle_check` | treat unleased GPUs above the VRAM threshold as busy |
 | `idle_threshold_gib` | busy threshold; idle cards sit near 0.3 GiB |
 | `ttl_minutes` | default checkout TTL |
