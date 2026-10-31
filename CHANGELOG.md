@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.0
+
+- NVIDIA/CUDA support (`vendor: auto|amd|nvidia`), preserving AMD behavior.
+- `occupancy_mode: auto|vram|process`; GB10/unified-memory hosts use process-presence
+  occupancy when NVML does not expose FB memory.
+- NVIDIA discovery, UUID→index mapping, compute-apps adoption (own-uid filtered),
+  foreign reservations, and MIG refusal.
+- NVIDIA environment: `CUDA_VISIBLE_DEVICES` + `CUDA_DEVICE_ORDER=PCI_BUS_ID`.
+- Status/config expose vendor, occupancy mode, GPU info, and UUIDs.
+- Fake-`nvidia-smi` tests for discrete, GB10, and fail-closed paths.
+
 ## 0.2.1
 
 - Hide the internal `_hold` subcommand from `--help`, usage, and invalid-choice

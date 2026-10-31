@@ -5,7 +5,7 @@
 ![python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
 
 GPU leases with **automatic adoption of unmanaged jobs**, for shared single-host
-AMD/ROCm boxes.
+AMD/ROCm and NVIDIA hosts.
 
 `gpulease` gives agents and people a polite way to check out 1..N GPUs — and, unlike
 cooperative-only locks, it also watches what is actually running and books it. Jobs
@@ -34,7 +34,8 @@ everything else, and it makes unmanaged usage visible.
 
 ## Install
 
-Requires Linux, Python 3.10+, and ROCm (`rocm-smi` on `PATH`).
+Requires Linux, Python 3.10+, and either ROCm (`rocm-smi` on `PATH`) or an NVIDIA
+driver (`nvidia-smi` on `PATH`).
 
 ```sh
 uv tool install git+https://github.com/redhat-et/gpulease
@@ -107,12 +108,14 @@ bypassed by break-glass.
 
 `$XDG_STATE_HOME/gpulease/config.json` (default
 `~/.local/state/gpulease/config.json`). Missing keys fall back to defaults; GPU count
-and pool are auto-detected from `rocm-smi` when not set.
+and pool are auto-detected from the vendor tool when not set.
 
 ```json
 {
   "gpus": [0, 1, 2, 3, 4, 5, 6, 7],
   "pool": [0, 1, 2, 3, 4, 5, 6, 7],
+  "vendor": "auto",
+  "occupancy_mode": "auto",
   "claims": {"0-3": "alice"},
   "reserved": {},
   "idle_check": true,
@@ -128,17 +131,20 @@ and pool are auto-detected from `rocm-smi` when not set.
 |---|---|
 | `gpus` | all GPU indices (default: detected) |
 | `pool` | allocatable indices (default: all non-reserved) |
+| `vendor` | `auto`, `amd`, or `nvidia` |
+| `occupancy_mode` | `auto`, `vram`, or `process` (process mode is required on GB10/unified-memory GPUs) |
 | `claims` | `{range: username}`: only that user's effective pool includes these GPUs |
 | `reserved` | `{range: note}` excluded from the pool for everyone; not bypassed by `--ignore-claims` (maintenance/global exclusion) |
-| `idle_check` | treat unleased GPUs above the VRAM threshold as busy |
-| `idle_threshold_gib` | busy threshold; idle cards sit near 0.3 GiB |
+| `idle_check` | treat unleased GPUs as busy (VRAM threshold in `vram` mode; any compute app in `process` mode) |
+| `idle_threshold_gib` | busy threshold in `vram` mode; idle cards sit near 0.3 GiB |
 | `ttl_minutes` | default checkout TTL |
 | `watch_interval_seconds` | adoption poll interval |
 | `adopt_grace_seconds` | release delay after unmanaged usage drains |
 | `default_wait_seconds` | default `--wait` (`-1` = forever) |
 
 Environment overrides: `GPULEASE_STATE_DIR`, `GPULEASE_SYSTEM_STATE_DIR`,
-`GPULEASE_ROCM_SMI`, `GPULEASE_PROC_ROOT`, `GPULEASE_OWNER`.
+`GPULEASE_ROCM_SMI`, `GPULEASE_NVIDIA_SMI`, `GPULEASE_VENDOR`,
+`GPULEASE_PROC_ROOT`, `GPULEASE_OWNER`.
 
 State resolution: `GPULEASE_STATE_DIR` → `/var/lib/gpulease` when its `.shared`
 marker exists → `$XDG_STATE_HOME/gpulease` (default `~/.local/state/gpulease`).
@@ -171,18 +177,22 @@ root watcher/daemon plus a mediated API.
 
 Every few seconds the watcher:
 
-1. scans `/proc/<pid>/fdinfo/*` for processes owned by you, reading `drm-pdev`
-   (PCI BDF) and `drm-memory-vram`;
-2. maps BDFs to `rocm-smi` device indices and keeps GPUs above the VRAM threshold
-   (HIP opens every render node at init, so open file descriptors are not usage —
-   only allocated VRAM is);
+1. **AMD:** scans `/proc/<pid>/fdinfo/*` for processes owned by you, reading
+   `drm-pdev` (PCI BDF) and `drm-memory-vram`; maps BDFs to `rocm-smi` indices and
+   keeps GPUs above the VRAM threshold (HIP opens every render node at init, so open
+   file descriptors are not usage — only allocated VRAM is).
+2. **NVIDIA:** queries `nvidia-smi --query-compute-apps` for process→GPU mappings,
+   filters to your uid, and adopts processes by presence (memory is optional).
+   `occupancy_mode=auto` uses VRAM when `nvidia-smi` reports `memory.total/used`, and
+   falls back to compute-process presence for unified-memory devices such as GB10.
 3. groups usage by process ancestry into one lease per job, with holder PIDs for
    liveness (`adopted` leases disappear when their PIDs die);
-4. flags VRAM not explained by your processes on pool GPUs as a `foreign`
-   reservation.
+4. flags usage not explained by any active lease as a `foreign` reservation. In
+   process mode, any uncovered compute app makes the GPU busy; if the compute-app
+   query fails, the GPU is treated as unknown/busy rather than free.
 
-`run` and `checkout` consider leased, adopted, foreign, and (optionally) VRAM-busy
-GPUs unavailable, so cooperative jobs never collide with unmanaged ones.
+`run` and `checkout` consider leased, adopted, foreign, and (optionally) busy GPUs
+unavailable, so cooperative jobs never collide with unmanaged ones.
 
 ## Agent integration
 
@@ -195,16 +205,18 @@ explicitly asks for it.
 
 ## Limitations
 
-- ROCm/AMD only (fdinfo `drm-pdev` + `rocm-smi`). NVIDIA support would need a
-  different probe.
-- Single-user state directory. Multiple Unix users need a shared state location and
-  permissions of their own.
-- Whole-GPU leases; no fractional/shared-GPU accounting.
+- Whole-GPU leases; no fractional/shared-GPU accounting. Multiple agents sharing a
+  single GPU are serialized.
 - No preemption: adopted jobs are respected, not killed.
-- Adoption relies on VRAM allocation above the threshold; tiny jobs may not be
-  attributed. `idle_check` covers most of the gap.
-- GPUs are addressed by HIP/`rocm-smi` index, never by render-node number
-  (on MI300X/MI355X each GPU exposes multiple `renderD*` nodes for its XCDs).
+- **AMD:** adoption relies on VRAM allocation above the threshold; tiny jobs may not
+  be attributed. GPUs are addressed by HIP/`rocm-smi` index, never by render-node
+  number (on MI300X/MI355X each GPU exposes multiple `renderD*` nodes for its XCDs).
+- **NVIDIA:** MIG is not supported (the tool refuses to run when MIG is enabled).
+  MPS, mixed AMD/NVIDIA hosts, and NVLink topology are out of scope.
+- **NVIDIA process mode (GB10/unified memory):** card memory is not exposed by
+  `nvidia-smi`, so occupancy is computed from compute-app presence. Graphics-only
+  users and processes hidden by permissions/container namespaces may not be visible;
+  if the compute-app query itself fails, GPUs are treated as unknown/busy, never free.
 - Shared mode is a trusted-group design (see [Multi-user shared state](#multi-user-shared-state));
   it is not a security boundary between group members.
 

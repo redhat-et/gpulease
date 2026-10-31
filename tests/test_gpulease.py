@@ -30,6 +30,42 @@ elif "--showbus" in sys.argv:
     print(json.dumps({f"card{g}": {"PCI Bus": bdf} for g, bdf in state.get("bus", {}).items()}))
 '''
 
+FAKE_NVIDIA_SRC = '''#!/usr/bin/env python3
+import json, os, sys
+state = json.load(open(os.environ["FAKE_NVIDIA_STATE"]))
+if state.get("fail"):
+    sys.exit(1)
+args = " ".join(sys.argv[1:])
+if "-L" in sys.argv:
+    for g in state.get("gpus", []):
+        print(f"GPU {g['index']}: {g.get('name', 'GPU')} (UUID: {g['uuid']})")
+        for mig in g.get("mig_devices", []):
+            print(f"  MIG {mig}")
+    sys.exit(0)
+if "--query-gpu=" in args:
+    q = next(a for a in sys.argv[1:] if a.startswith("--query-gpu="))
+    fields = q.split("=", 1)[1].split(",")
+    keymap = {
+        "index": "index", "uuid": "uuid", "name": "name",
+        "memory.total": "memory_total", "memory.used": "memory_used",
+        "mig.mode.current": "mig",
+    }
+    for g in state.get("gpus", []):
+        vals = []
+        for field in fields:
+            val = g.get(keymap.get(field, field))
+            vals.append("[N/A]" if val is None else str(val))
+        print(", ".join(vals))
+    sys.exit(0)
+if "--query-compute-apps=" in args:
+    for a in state.get("apps", []):
+        mem = a.get("used_mib")
+        print(f"{a['pid']}, {a.get('name', 'proc')}, {a['uuid']}, "
+              f"{'[N/A]' if mem is None else mem}")
+    sys.exit(0)
+sys.exit(1)
+'''
+
 
 def write_fake_proc(root, pid, comm, ppid, fdinfo, uid=None, cmdline=""):
     d = root / str(pid)
@@ -55,6 +91,7 @@ class Base(unittest.TestCase):
         (self.state / "config.json").write_text(json.dumps({
             "gpus": list(range(8)),
             "pool": [4, 5, 6, 7],
+            "vendor": "amd",
             "reserved": {"0-3": "test"},
         }))
         self.proc = self.tmp / "proc"
@@ -63,18 +100,27 @@ class Base(unittest.TestCase):
         self.rocm = self.tmp / "fake-rocm-smi"
         self.rocm.write_text(FAKE_ROCM_SRC)
         self.rocm.chmod(self.rocm.stat().st_mode | stat.S_IEXEC)
+        self.nvidia_state = self.tmp / "nvidia.json"
+        self.nvidia = self.tmp / "fake-nvidia-smi"
+        self.nvidia.write_text(FAKE_NVIDIA_SRC)
+        self.nvidia.chmod(self.nvidia.stat().st_mode | stat.S_IEXEC)
         self.env = os.environ.copy()
         self.env["GPULEASE_STATE_DIR"] = str(self.state)
         self.env["GPULEASE_ROCM_SMI"] = str(self.rocm)
         self.env["FAKE_ROCM_STATE"] = str(self.rocm_state)
+        self.env["GPULEASE_NVIDIA_SMI"] = str(self.nvidia)
+        self.env["FAKE_NVIDIA_STATE"] = str(self.nvidia_state)
         self.env.pop("GPULEASE_PROC_ROOT", None)
         self.set_rocm(vram={}, bus={})
-        for k in ("GPULEASE_STATE_DIR", "GPULEASE_ROCM_SMI", "FAKE_ROCM_STATE", "GPULEASE_PROC_ROOT"):
+        self.set_nvidia(gpus=[], apps=[])
+        for k in ("GPULEASE_STATE_DIR", "GPULEASE_ROCM_SMI", "FAKE_ROCM_STATE",
+                  "GPULEASE_NVIDIA_SMI", "FAKE_NVIDIA_STATE", "GPULEASE_PROC_ROOT"):
             os.environ[k] = self.env.get(k, "")
         os.environ.pop("GPULEASE_PROC_ROOT", None)
 
     def tearDown(self):
-        for k in ("GPULEASE_STATE_DIR", "GPULEASE_ROCM_SMI", "FAKE_ROCM_STATE", "GPULEASE_PROC_ROOT"):
+        for k in ("GPULEASE_STATE_DIR", "GPULEASE_ROCM_SMI", "FAKE_ROCM_STATE",
+                  "GPULEASE_NVIDIA_SMI", "FAKE_NVIDIA_STATE", "GPULEASE_PROC_ROOT"):
             os.environ.pop(k, None)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
@@ -82,6 +128,13 @@ class Base(unittest.TestCase):
         self.rocm_state.write_text(json.dumps({
             "vram": {str(k): v for k, v in (vram or {}).items()},
             "bus": {str(k): v for k, v in (bus or {}).items()},
+        }))
+
+    def set_nvidia(self, gpus=None, apps=None, fail=False):
+        self.nvidia_state.write_text(json.dumps({
+            "gpus": gpus or [],
+            "apps": apps or [],
+            "fail": fail,
         }))
 
     def cli(self, *args, **kw):
@@ -422,6 +475,129 @@ class TestSharedClaims(Base):
         }, clear=False):
             os.environ.pop("GPULEASE_STATE_DIR", None)
             self.assertEqual(gpulease.state_dir(), shared)
+
+
+class TestNvidia(Base):
+    def setUp(self):
+        super().setUp()
+        self.write_cfg()
+
+    def write_cfg(self, **over):
+        cfg = {
+            "gpus": [0, 1], "pool": [0, 1], "vendor": "nvidia",
+            "reserved": {}, "claims": {},
+        }
+        cfg.update(over)
+        (self.state / "config.json").write_text(json.dumps(cfg))
+
+    def gb10(self, apps=None, mig=None):
+        self.set_nvidia(
+            gpus=[{
+                "index": 0, "uuid": "GPU-spark", "name": "NVIDIA GB10",
+                "memory_total": None, "memory_used": None, "mig": mig,
+            }],
+            apps=apps or [],
+        )
+
+    def discrete(self):
+        self.set_nvidia(gpus=[{
+            "index": 0, "uuid": "GPU-rtx", "name": "RTX PRO 6000",
+            "memory_total": 49140, "memory_used": 100, "mig": "Disabled",
+        }], apps=[])
+
+    def test_gb10_process_mode_and_env(self):
+        self.gb10(apps=[
+            {"pid": 101, "name": "vllm", "uuid": "GPU-spark", "used_mib": 90528},
+        ])
+        cfg = gpulease.load_config()
+        snap = gpulease.gpu_snapshot(cfg)
+        self.assertEqual(snap["vendor"], "nvidia")
+        self.assertEqual(snap["mode"], "process")
+        self.assertEqual(snap["vram"], {})
+        self.assertFalse(snap["unknown"])
+        restricted = gpulease.idle_vram(cfg, 2 * gpulease.GIB)
+        self.assertGreaterEqual(restricted[0], 2 * gpulease.GIB)
+        env = gpulease.build_env([0], "lease-x", "nvidia")
+        self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "0")
+        self.assertEqual(env["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
+        self.assertNotIn("HIP_VISIBLE_DEVICES", env)
+
+    def test_discrete_vram_mode(self):
+        self.discrete()
+        cfg = gpulease.load_config()
+        snap = gpulease.gpu_snapshot(cfg)
+        self.assertEqual(snap["mode"], "vram")
+        self.assertEqual(snap["vram"][0], 100 * 1024 * 1024)
+        self.assertEqual(gpulease.nvidia_uuid_map(), {0: "GPU-rtx"})
+
+    def test_own_uid_adoption_and_foreign(self):
+        self.gb10(apps=[
+            {"pid": 101, "name": "vllm", "uuid": "GPU-spark", "used_mib": 90528},
+            {"pid": 102, "name": "other", "uuid": "GPU-spark", "used_mib": 1024},
+        ])
+        write_fake_proc(self.proc, 101, "vllm", 1, [], cmdline="vllm serve")
+        write_fake_proc(self.proc, 102, "other", 1, [], uid=os.getuid() + 1)
+        os.environ["GPULEASE_PROC_ROOT"] = str(self.proc)
+        cfg = gpulease.load_config()
+        snap = gpulease.gpu_snapshot(cfg)
+        usage, own_vram = gpulease.nvidia_own_usage(snap["apps"])
+        self.assertEqual(set(usage), {101})
+        self.assertEqual(own_vram[0], 90528 * 1024 * 1024)
+        now = time.time()
+        leases = {}
+        clusters = gpulease.build_clusters(usage)
+        gpulease.reconcile_adopted(leases, clusters, now, "me")
+        self.assertEqual(len(leases), 1)
+        events = gpulease.reconcile_foreign(
+            leases, cfg, own_vram, snap["vram"], now,
+            mode="process", busy_gpus=snap["busy"],
+        )
+        self.assertEqual(events, [])
+        for lid in list(leases):
+            gpulease.remove_lease(lid)
+            leases.pop(lid)
+        events = gpulease.reconcile_foreign(
+            leases, cfg, own_vram, snap["vram"], now,
+            mode="process", busy_gpus=snap["busy"],
+        )
+        self.assertEqual([e[0] for e in events], ["foreign"])
+        self.assertEqual(list(leases.values())[0]["gpus"], [0])
+        self.assertEqual(list(leases.values())[0]["cmd"], "uncovered compute processes")
+
+    def test_compute_apps_failure_fails_closed(self):
+        self.gb10()
+        self.set_nvidia(gpus=[{"index": 0, "uuid": "GPU-spark", "name": "GB10"}], fail=True)
+        cfg = gpulease.load_config()
+        snap = gpulease.gpu_snapshot(cfg)
+        self.assertTrue(snap["unknown"])
+        rec, _ = gpulease.try_allocate(1, cfg, "me", "run", 0, True)
+        self.assertIsNone(rec)
+
+    def test_mig_refused(self):
+        self.gb10(mig="Enabled")
+        r = self.cli("status")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("MIG is enabled", r.stderr)
+
+    def test_mixed_vendor_refused(self):
+        self.write_cfg(vendor="auto")
+        self.set_rocm(vram={0: 1024}, bus={})
+        self.discrete()
+        cfg = gpulease.load_config()
+        with self.assertRaises(SystemExit):
+            gpulease.resolve_vendor(cfg)
+
+    def test_status_json_gb10(self):
+        self.gb10(apps=[
+            {"pid": 101, "name": "vllm", "uuid": "GPU-spark", "used_mib": 90528},
+        ])
+        r = self.cli("status", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        self.assertEqual(data["vendor"], "nvidia")
+        self.assertEqual(data["occupancy_mode"], "process")
+        self.assertIsNone(data["gpus"][0]["vram_bytes"])
+        self.assertEqual(data["gpus"][0]["state"], "busy")
 
 
 class TestDefaults(Base):

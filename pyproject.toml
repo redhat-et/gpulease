@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gpulease"
-version = "0.2.1"
-description = "GPU leases with automatic adoption of unmanaged jobs, for shared ROCm hosts"
+version = "0.3.0"
+description = "GPU leases with automatic adoption of unmanaged jobs, for shared ROCm/NVIDIA hosts"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.10"
 authors = [{name = "Mathew Odden", email = "modden@redhat.com"}]
-keywords = ["gpu", "rocm", "amd", "scheduler", "leases", "agents", "vllm"]
+keywords = ["gpu", "rocm", "amd", "nvidia", "cuda", "scheduler", "leases", "agents", "vllm"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",

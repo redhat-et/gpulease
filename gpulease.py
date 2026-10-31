@@ -4,6 +4,7 @@
 """gpulease — GPU checkout manager with adoption watcher. Single-file, stdlib only."""
 
 import argparse
+import csv
 import fcntl
 import json
 import os
@@ -19,11 +20,13 @@ from contextlib import contextmanager
 from pathlib import Path
 
 GIB = 1 << 30
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 DEFAULTS = {
     "gpus": None,
     "pool": None,
+    "vendor": "auto",
+    "occupancy_mode": "auto",
     "reserved": {},
     "claims": {},
     "idle_check": True,
@@ -117,6 +120,10 @@ def rocm_smi_cmd():
     return os.environ.get("GPULEASE_ROCM_SMI", "rocm-smi")
 
 
+def nvidia_smi_cmd():
+    return os.environ.get("GPULEASE_NVIDIA_SMI", "nvidia-smi")
+
+
 def proc_root():
     return Path(os.environ.get("GPULEASE_PROC_ROOT", "/proc"))
 
@@ -189,7 +196,7 @@ def load_config():
         for k, v in user.items():
             cfg[k] = v
     if cfg.get("gpus") is None:
-        cfg["gpus"] = detect_gpus()
+        cfg["gpus"] = detect_gpus(resolve_vendor(cfg))
     else:
         cfg["gpus"] = sorted(set(cfg["gpus"]))
     reserved = set()
@@ -416,7 +423,9 @@ def rocm_vram():
     return out
 
 
-def detect_gpus():
+def detect_gpus(vendor="amd"):
+    if vendor == "nvidia":
+        return sorted(nvidia_gpu_info())
     return sorted(rocm_vram())
 
 
@@ -431,6 +440,233 @@ def rocm_bdf_map():
         if bus:
             out[int(m.group(1))] = bus.strip().lower()
     return out
+
+
+def _nvidia_num(val):
+    val = (val or "").strip()
+    if not val or "N/A" in val or "Not Supported" in val:
+        return None
+    try:
+        return int(float(val))
+    except ValueError:
+        return None
+
+
+def nvidia_csv(args):
+    try:
+        proc = subprocess.run(
+            [nvidia_smi_cmd()] + args,
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    return [line for line in proc.stdout.splitlines() if line.strip()]
+
+
+def nvidia_gpu_info():
+    rows = nvidia_csv([
+        "--query-gpu=index,uuid,name,memory.total,memory.used",
+        "--format=csv,noheader,nounits",
+    ])
+    info = {}
+    if rows is not None:
+        for row in rows:
+            parts = [f.strip() for f in next(csv.reader([row]))]
+            if len(parts) < 3:
+                continue
+            try:
+                idx = int(parts[0])
+            except ValueError:
+                continue
+            total = _nvidia_num(parts[3]) if len(parts) > 3 else None
+            used = _nvidia_num(parts[4]) if len(parts) > 4 else None
+            info[idx] = {
+                "uuid": None if "N/A" in parts[1] else parts[1],
+                "name": parts[2],
+                "memory_total": total * 1024 * 1024 if total is not None else None,
+                "memory_used": used * 1024 * 1024 if used is not None else None,
+                "mig": None,
+            }
+    if not info:
+        try:
+            proc = subprocess.run(
+                [nvidia_smi_cmd(), "-L"], capture_output=True, text=True, timeout=30
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return {}
+        if proc.returncode != 0:
+            return {}
+        for line in proc.stdout.splitlines():
+            m = re.search(r"GPU\s+(\d+):\s+(.*?)\s+\(UUID:\s*([^)]+)\)", line)
+            if m:
+                info[int(m.group(1))] = {
+                    "uuid": m.group(3), "name": m.group(2),
+                    "memory_total": None, "memory_used": None, "mig": None,
+                }
+    return info
+
+
+def nvidia_vram(info=None):
+    info = nvidia_gpu_info() if info is None else info
+    return {
+        idx: data["memory_used"]
+        for idx, data in info.items()
+        if data.get("memory_used") is not None
+    }
+
+
+def nvidia_uuid_map(info=None):
+    info = nvidia_gpu_info() if info is None else info
+    return {idx: data["uuid"] for idx, data in info.items() if data.get("uuid")}
+
+
+def nvidia_compute_apps(info=None):
+    rows = nvidia_csv([
+        "--query-compute-apps=pid,process_name,gpu_uuid,used_gpu_memory",
+        "--format=csv,noheader,nounits",
+    ])
+    if rows is None:
+        return None
+    uuid_to_idx = {uuid: idx for idx, uuid in nvidia_uuid_map(info).items()}
+    apps = {}
+    for row in rows:
+        parts = [f.strip() for f in next(csv.reader([row]))]
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        gpu = uuid_to_idx.get(parts[2])
+        if gpu is None:
+            continue
+        mem = _nvidia_num(parts[3]) if len(parts) > 3 else None
+        apps.setdefault(pid, {})[gpu] = mem * 1024 * 1024 if mem is not None else None
+    return apps
+
+
+def nvidia_mig_enabled(info=None):
+    rows = nvidia_csv([
+        "--query-gpu=index,mig.mode.current",
+        "--format=csv,noheader,nounits",
+    ])
+    if rows:
+        for row in rows:
+            parts = [f.strip() for f in next(csv.reader([row]))]
+            if len(parts) < 2:
+                continue
+            mig = parts[1].strip().lower()
+            if mig and mig not in ("n/a", "[n/a]", "none", "disabled"):
+                return True
+        return False
+    try:
+        proc = subprocess.run(
+            [nvidia_smi_cmd(), "-L"], capture_output=True, text=True, timeout=30
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return "MIG" in proc.stdout
+
+
+def resolve_vendor(cfg):
+    vendor = (cfg.get("vendor") or "auto").lower()
+    if vendor in ("amd", "nvidia"):
+        return vendor
+    if vendor != "auto":
+        raise SystemExit(f"gpulease: invalid vendor {vendor!r} (use auto|amd|nvidia)")
+    amd = bool(rocm_vram())
+    nv = bool(nvidia_gpu_info())
+    if amd and nv:
+        raise SystemExit("gpulease: both AMD and NVIDIA GPUs detected; set vendor=amd|nvidia")
+    if nv:
+        return "nvidia"
+    return "amd"
+
+
+def resolve_occupancy_mode(cfg, vendor, info=None):
+    mode = (cfg.get("occupancy_mode") or "auto").lower()
+    if mode in ("vram", "process"):
+        return mode
+    if mode != "auto":
+        raise SystemExit(
+            f"gpulease: invalid occupancy_mode {mode!r} (use auto|vram|process)"
+        )
+    if vendor != "nvidia":
+        return "vram"
+    info = nvidia_gpu_info() if info is None else info
+    if any(
+        d.get("memory_total") is not None or d.get("memory_used") is not None
+        for d in info.values()
+    ):
+        return "vram"
+    return "process"
+
+
+def gpu_snapshot(cfg):
+    vendor = resolve_vendor(cfg)
+    if vendor == "amd":
+        return {
+            "vendor": "amd", "mode": "vram", "info": {}, "apps": {},
+            "vram": rocm_vram(), "busy": set(), "unknown": False,
+        }
+    info = nvidia_gpu_info()
+    mode = resolve_occupancy_mode(cfg, vendor, info)
+    apps = nvidia_compute_apps(info)
+    if mode == "process" and any(not d.get("uuid") for d in info.values()):
+        apps = None
+    if apps is None:
+        busy = set(cfg["gpus"])
+        unknown = True
+    else:
+        busy = {g for per in apps.values() for g in per}
+        unknown = False
+    return {
+        "vendor": "nvidia", "mode": mode, "info": info, "apps": apps,
+        "vram": nvidia_vram(info) if mode == "vram" else {},
+        "busy": busy, "unknown": unknown,
+    }
+
+
+def idle_vram(cfg, threshold):
+    snap = gpu_snapshot(cfg)
+    vram = dict(snap["vram"])
+    if snap["unknown"]:
+        for g in cfg["pool"]:
+            vram[g] = max(vram.get(g, 0), threshold)
+    elif snap["mode"] == "process":
+        for g in snap["busy"]:
+            vram[g] = max(vram.get(g, 0), threshold)
+    return vram
+
+
+def proc_uid(pid):
+    try:
+        status = (proc_root() / str(pid) / "status").read_text()
+    except OSError:
+        return None
+    m = re.search(r"^Uid:\s+(\d+)", status, re.M)
+    return int(m.group(1)) if m else None
+
+
+def nvidia_own_usage(apps):
+    uid = os.getuid()
+    usage = {}
+    own_vram = {}
+    if not apps:
+        return usage, own_vram
+    for pid, per_gpu in apps.items():
+        if proc_uid(pid) != uid:
+            continue
+        gpu_map = {}
+        for g, mem in per_gpu.items():
+            gpu_map[g] = mem or 0
+            if mem:
+                own_vram[g] = own_vram.get(g, 0) + mem
+        if gpu_map:
+            usage[pid] = gpu_map
+    return usage, own_vram
 
 
 def parse_gpu_list(spec):
@@ -529,7 +765,7 @@ def try_allocate(n, cfg, owner, kind, wait, idle_check, ttl_minutes=None,
             leases = read_leases()
             reap_locked(leases, cfg, now)
             busy = busy_from_leases(leases, cfg, now)
-        vram = rocm_vram() if idle_check else {}
+        vram = idle_vram(cfg, threshold) if idle_check else {}
         cand = ordered_free(pool, busy, vram, threshold, idle_check, required, prefer)
         if len(cand) >= n:
             with alloc_lock():
@@ -590,22 +826,32 @@ def try_allocate(n, cfg, owner, kind, wait, idle_check, ttl_minutes=None,
         time.sleep(1.0 + random.random() * 2.0)
 
 
-def build_env(gpus, lease_id):
+def build_env(gpus, lease_id, vendor="amd"):
     env = os.environ.copy()
     for key in ("ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"):
         env.pop(key, None)
-    env["HIP_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpus)
+    vis = ",".join(str(g) for g in gpus)
+    if vendor == "nvidia":
+        env["CUDA_VISIBLE_DEVICES"] = vis
+        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    else:
+        env["HIP_VISIBLE_DEVICES"] = vis
     env["GPULEASE_LEASE_ID"] = lease_id
-    env["GPULEASE_GPUS"] = ",".join(str(g) for g in gpus)
+    env["GPULEASE_GPUS"] = vis
     return env
 
 
 def export_lines(rec):
-    return [
-        f"export HIP_VISIBLE_DEVICES={','.join(str(g) for g in rec['gpus'])}",
-        f"export GPULEASE_LEASE_ID={rec['id']}",
-        f"export GPULEASE_GPUS={','.join(str(g) for g in rec['gpus'])}",
-    ]
+    vis = ",".join(str(g) for g in rec["gpus"])
+    lines = []
+    if rec.get("vendor") == "nvidia":
+        lines.append(f"export CUDA_VISIBLE_DEVICES={vis}")
+        lines.append("export CUDA_DEVICE_ORDER=PCI_BUS_ID")
+    else:
+        lines.append(f"export HIP_VISIBLE_DEVICES={vis}")
+    lines.append(f"export GPULEASE_LEASE_ID={rec['id']}")
+    lines.append(f"export GPULEASE_GPUS={vis}")
+    return lines
 
 
 def watch_log(msg):
@@ -810,13 +1056,17 @@ def reconcile_adopted(leases, clusters, now, owner):
     return events
 
 
-def reconcile_foreign(leases, cfg, own_vram, card_vram, now):
+def reconcile_foreign(leases, cfg, own_vram, card_vram, now,
+                      mode="vram", busy_gpus=None, unknown=False):
     threshold = cfg["idle_threshold_gib"] * GIB
-    if is_shared():
-        covered = set()
-        for rec in leases.values():
-            if rec.get("type") in ("run", "checkout", "adopted") and lease_active(rec, cfg, now):
-                covered.update(rec.get("gpus", []))
+    covered = set()
+    for rec in leases.values():
+        if rec.get("type") in ("run", "checkout", "adopted") and lease_active(rec, cfg, now):
+            covered.update(rec.get("gpus", []))
+    if mode == "process":
+        busy = set(cfg["pool"]) if unknown else set(busy_gpus or ())
+        foreign_gpus = [g for g in cfg["pool"] if g in busy and g not in covered]
+    elif is_shared():
         foreign_gpus = [
             g for g in cfg["pool"]
             if card_vram.get(g, 0) >= threshold and g not in covered
@@ -828,6 +1078,7 @@ def reconcile_foreign(leases, cfg, own_vram, card_vram, now):
             explained = own_vram.get(g, 0)
             if used - explained >= threshold:
                 foreign_gpus.append(g)
+    reason = "uncovered compute processes" if mode == "process" else "unattributed VRAM usage"
     events = []
     existing = [r for r in leases.values() if r.get("type") == "foreign"]
     if foreign_gpus:
@@ -836,8 +1087,9 @@ def reconcile_foreign(leases, cfg, own_vram, card_vram, now):
             for extra in existing[1:]:
                 remove_lease(extra["id"])
                 leases.pop(extra["id"], None)
-            if rec.get("gpus") != foreign_gpus:
+            if rec.get("gpus") != foreign_gpus or rec.get("cmd") != reason:
                 rec["gpus"] = foreign_gpus
+                rec["cmd"] = reason
                 events.append(("update", rec))
             rec["heartbeat"] = now
             write_lease(rec)
@@ -849,7 +1101,7 @@ def reconcile_foreign(leases, cfg, own_vram, card_vram, now):
                 "gpus": foreign_gpus,
                 "pids": [],
                 "holder_pid": None,
-                "cmd": "unattributed VRAM usage",
+                "cmd": reason,
                 "created": now,
                 "expires": None,
                 "heartbeat": now,
@@ -868,7 +1120,11 @@ def reconcile_foreign(leases, cfg, own_vram, card_vram, now):
 
 def watch_cycle(cfg, announce=False):
     now = time.time()
-    usage, own_vram = scan_own_usage(cfg["idle_threshold_gib"] * GIB)
+    snap = gpu_snapshot(cfg)
+    if snap["vendor"] == "nvidia":
+        usage, own_vram = nvidia_own_usage(snap["apps"])
+    else:
+        usage, own_vram = scan_own_usage(cfg["idle_threshold_gib"] * GIB)
     if not usage:
         usage = {}
     with alloc_lock():
@@ -877,8 +1133,10 @@ def watch_cycle(cfg, announce=False):
         holders = live_holder_pids(leases, cfg, now)
         clusters = build_clusters(filter_covered(usage, holders))
         events = reconcile_adopted(leases, clusters, now, user_name())
-        card_vram = rocm_vram()
-        events += reconcile_foreign(leases, cfg, own_vram, card_vram, now)
+        events += reconcile_foreign(
+            leases, cfg, own_vram, snap["vram"], now,
+            mode=snap["mode"], busy_gpus=snap["busy"], unknown=snap["unknown"],
+        )
     for action, rec in events:
         msg = f"{action} {rec['id']} type={rec['type']} gpus={fmt_gpus(rec.get('gpus', []))} pids={rec.get('pids', [])} cmd={rec.get('cmd', '')!r}"
         watch_log(msg)
@@ -970,9 +1228,11 @@ def cmd_run(args):
     if not cmd:
         print("gpulease: run requires a command after --", file=sys.stderr)
         return 2
+    vendor = resolve_vendor(cfg)
     rec, fds = try_allocate(
         n, cfg, args.owner, "run", args.wait, args.idle_check, quiet=args.quiet,
         required=required, prefer=prefer, requested=requested, pool=pool,
+        extra={"vendor": vendor},
     )
     if rec is None:
         print(
@@ -981,7 +1241,7 @@ def cmd_run(args):
         )
         return 3
     apply_claim_override(rec, cfg, args)
-    env = build_env(rec["gpus"], rec["id"])
+    env = build_env(rec["gpus"], rec["id"], rec.get("vendor", "amd"))
     override = ""
     if rec.get("claims_ignored"):
         override = f" claims-ignored={fmt_gpus(rec['claims_ignored'])}"
@@ -1041,10 +1301,12 @@ def cmd_checkout(args):
     if args.idle_check is None:
         args.idle_check = cfg["idle_check"]
     ttl = args.ttl if args.ttl is not None else cfg["ttl_minutes"]
+    vendor = resolve_vendor(cfg)
     rec, fds = try_allocate(
         n, cfg, args.owner, "checkout", args.wait, args.idle_check,
         ttl_minutes=ttl, quiet=args.quiet,
         required=required, prefer=prefer, requested=requested, pool=pool,
+        extra={"vendor": vendor},
     )
     if rec is None:
         print(
@@ -1208,7 +1470,11 @@ def cmd_status(args):
         leases = read_leases()
         removed = reap_locked(leases, cfg, now)
         active = [r for r in leases.values() if lease_active(r, cfg, now)]
-    vram = rocm_vram()
+    snap = gpu_snapshot(cfg)
+    vram = snap["vram"]
+    mode = snap["mode"]
+    busy = snap["busy"]
+    unknown = snap["unknown"]
     threshold = cfg["idle_threshold_gib"] * GIB
     cm = claims_map(cfg)
     pool = effective_pool(cfg, uid)
@@ -1222,7 +1488,7 @@ def cmd_status(args):
     rows = []
     for g in cfg["gpus"]:
         rec = by_gpu.get(g)
-        used = vram.get(g, 0)
+        used = vram.get(g)
         reserved = g in reserved_gpus
         claim = claim_owner_name(cfg, g)
         claim_uid = cm.get(g)
@@ -1234,9 +1500,17 @@ def cmd_status(args):
                 "age_seconds": int(now - rec.get("created", now)),
                 "cmd": rec.get("cmd", ""), "lease_id": rec["id"],
             }
-        elif used < threshold:
+        else:
+            if mode == "process":
+                is_busy = unknown or g in busy
+            else:
+                is_busy = used is not None and used >= threshold
             if reserved:
-                state = "reserved"
+                state = "reserved-busy" if is_busy else "reserved"
+            elif unknown:
+                state = "unknown"
+            elif is_busy:
+                state = "busy"
             elif claim_uid is not None:
                 state = "claimed"
             else:
@@ -1246,29 +1520,25 @@ def cmd_status(args):
                 "state": state, "lease_type": None, "owner": None, "uid": None,
                 "age_seconds": None, "cmd": None, "lease_id": None,
             }
-        else:
-            row = {
-                "gpu": g, "reserved": reserved, "claim": claim, "vram_bytes": used,
-                "state": "reserved-busy" if reserved else "busy",
-                "lease_type": None, "owner": None, "uid": None,
-                "age_seconds": None, "cmd": None, "lease_id": None,
-            }
         rows.append(row)
     if args.json:
         print(json.dumps({
             "pool": cfg["pool"], "reserved": cfg["reserved"], "claims": cfg["claims"],
             "effective_pool": pool, "uid": uid, "user": user_name(uid),
+            "vendor": snap["vendor"], "occupancy_mode": mode,
+            "gpu_info": snap["info"], "unknown": unknown,
             "shared": is_shared(), "state_dir": str(state_dir()),
             "leases": active, "gpus": rows, "reaped": removed,
         }, indent=2))
         return 0
     print(f"pool={fmt_gpus(cfg['pool'])} effective={fmt_gpus(pool)} "
+          f"vendor={snap['vendor']} occupancy={mode} "
           f"claims={cfg['claims']} reserved={cfg['reserved']} "
           f"idle_threshold={cfg['idle_threshold_gib']:.1f}GiB "
           f"mode={'shared' if is_shared() else 'user'}")
     print(f"{'GPU':<4} {'RES':<4} {'CLAIM':<12} {'VRAM':>9} {'STATE':<14} {'TYPE':<8} {'OWNER':<10} {'AGE':<6} CMD")
     for row in rows:
-        vram_s = f"{row['vram_bytes'] / GIB:8.1f}G"
+        vram_s = "n/a" if row["vram_bytes"] is None else f"{row['vram_bytes'] / GIB:8.1f}G"
         print(
             f"{row['gpu']:<4} {'yes' if row['reserved'] else '-':<4} "
             f"{(row['claim'] or '-'):<12} {vram_s:>9} "
@@ -1290,9 +1560,12 @@ def cmd_status(args):
 def cmd_pool(args):
     cfg = load_config()
     uid = current_uid()
+    vendor = resolve_vendor(cfg)
+    mode = resolve_occupancy_mode(cfg, vendor)
     print(json.dumps({
         "gpus": cfg["gpus"], "pool": cfg["pool"],
         "effective_pool": effective_pool(cfg, uid),
+        "vendor": vendor, "occupancy_mode": mode,
         "claims": cfg["claims"], "reserved": cfg["reserved"],
         "shared": is_shared(), "state_dir": str(state_dir()),
         "user": user_name(uid), "uid": uid,
@@ -1531,8 +1804,17 @@ def main(argv=None):
     cfg = load_config()
     if not cfg["gpus"]:
         print(
-            "gpulease: no GPUs detected (is rocm-smi installed? set GPULEASE_ROCM_SMI "
-            f"or configure gpus in {state_dir() / 'config.json'})",
+            "gpulease: no GPUs detected (need rocm-smi or nvidia-smi; set "
+            "GPULEASE_ROCM_SMI/GPULEASE_NVIDIA_SMI, vendor, or configure gpus in "
+            f"{state_dir() / 'config.json'})",
+            file=sys.stderr,
+        )
+        return 2
+    vendor = resolve_vendor(cfg)
+    if vendor == "nvidia" and nvidia_mig_enabled():
+        print(
+            "gpulease: MIG is enabled; whole-GPU leases are not supported on MIG "
+            "instances (disable MIG or use vendor-specific tooling)",
             file=sys.stderr,
         )
         return 2
