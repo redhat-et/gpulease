@@ -10,6 +10,7 @@
 - NVIDIA environment: `CUDA_VISIBLE_DEVICES` + `CUDA_DEVICE_ORDER=PCI_BUS_ID`.
 - Status/config expose vendor, occupancy mode, GPU info, and UUIDs.
 - Fake-`nvidia-smi` tests for discrete, GB10, and fail-closed paths.
+- `tests/validate_nvidia.sh` hardware validation script and runbook.
 
 ## 0.2.1
 

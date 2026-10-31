@@ -238,6 +238,7 @@ To our knowledge, no existing tool adopts unmanaged processes, which is why `gpu
 ```sh
 python3 -m unittest discover -s tests -v
 python3 tests/integration_onbox.sh   # 8-GPU ROCm host; bookkeeping-only checks
+GPULEASE="$PWD/gpulease.py" tests/validate_nvidia.sh  # NVIDIA GPU host; see docs/validate-nvidia.md
 ```
 
 Unit tests use a fake `rocm-smi`, fake `/proc` trees, and temporary state
